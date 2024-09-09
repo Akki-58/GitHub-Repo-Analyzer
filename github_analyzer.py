@@ -1,216 +1,197 @@
-from dotenv import load_dotenv
 import os
-# import langchain
-# print(langchain.__version__)
-
 import requests
-from transformers import AutoTokenizer, AutoModel
+from pinecone import Pinecone, ServerlessSpec
+from transformers import RobertaTokenizer, RobertaModel
 import torch
-from pinecone import Pinecone
-from concurrent.futures import ThreadPoolExecutor
-
-load_dotenv()
-
-# GitHub API endpoint
-API_ENDPOINT = "https://api.github.com"
-FILE_SIZE_THRESHOLD = 1024 * 1024 * 5  # 5 MB file size limit
+import base64
 
 # Initialize Pinecone
-pc = Pinecone(api_key=os.getenv("PINECONE_KEY"))
-index = pc.Index("github-code")  # Ensure this matches your Pinecone setup
+def initialize_pinecone(index_name, dimension=768):
+    # Debug print statement
+    print("Inside initialize_pinecone")
 
-# Load CodeBERT
-tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
-model = AutoModel.from_pretrained("microsoft/codebert-base")
+    pc = Pinecone(api_key=os.environ.get("PINECONE_KEY"))
 
-# Cache to store repository details
-repo_cache = {}
-
-def get_user_repos(username, token=None):
-    """
-    Fetch the list of public repositories for a given GitHub username.
-    """
-    headers = {}
-    if token:
-        headers['Authorization'] = f'token {token}'
+    # Now do stuff
+    if index_name not in pc.list_indexes().names():
+        pc.create_index(
+            name=index_name,
+            dimension=dimension,
+            metric='cosine',
+            spec=ServerlessSpec(
+                cloud='aws',
+                region='us-east-1'
+            )
+        )
     
-    url = f"{API_ENDPOINT}/users/{username}/repos?per_page=100"
+    index = pc.Index(index_name)
+    return index
+
+# Function to extract GitHub username from the profile URL
+def extract_username(github_url):
+    # Debug print statement
+    print("Inside extract username")
+
+    if "github.com/" in github_url:
+        return github_url.split("github.com/")[1].split('/')[0]
+    else:
+        raise ValueError("Invalid GitHub profile URL")
+
+# Function to get repositories for a user with GitHub token for authentication
+def get_repositories(username, token):
+    # Debug print statement
+    print("Inside get_repositories")
+
+    url = f"https://api.github.com/users/{username}/repos"
+    headers = {'Authorization': f'token {token}'}
+    
     response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        raise Exception(f"Failed to fetch repositories for {username}, status code: {response.status_code}")
+    
     repos = response.json()
-
-    while 'next' in response.links:
-        next_url = response.links['next']['url']
-        response = requests.get(next_url, headers=headers)
-        repos.extend(response.json())
-
     return repos
 
-def get_repo_details(repo_url, token=None):
-    """
-    Fetch the detailed information of a repository.
-    """
-    if repo_url in repo_cache:
-        return repo_cache[repo_url]
-    
-    headers = {}
-    if token:
-        headers['Authorization'] = f'token {token}'
-    
-    response = requests.get(repo_url, headers=headers)
-    if response.status_code != 200:
-        print(f"Error fetching repo details: {response.status_code}")
-        return {}
-    
-    repo_details = response.json()
-    repo_cache[repo_url] = repo_details
-    return repo_details
+# Function to prioritize files based on their extension, with GitHub token for authentication
+def prioritize_files(username, repo_name, token):
+    # Debug print statement
+    print("Inside prioritize_files")
 
-def get_repo_languages(repo_url, token=None):
-    """
-    Fetch the programming languages used in a repository.
-    """
-    headers = {}
-    if token:
-        headers['Authorization'] = f'token {token}'
+    branches = ['main', 'master']
+    files = []
     
-    url = f"{repo_url}/languages"
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        print(f"Error fetching languages: {response.status_code}")
-        return {}
-    
-    languages = response.json()
-    return languages
+    for branch in branches:
+        tree_url = f"https://api.github.com/repos/{username}/{repo_name}/git/trees/{branch}?recursive=1"
+        headers = {'Authorization': f'token {token}'}
+        
+        response = requests.get(tree_url, headers=headers)
+        
+        if response.status_code == 200:
+            files = response.json().get('tree', [])
+            print(f"Successfully fetched file tree from branch: {branch}")
+            break
+        else:
+            print(f"Failed to fetch file tree from branch: {branch}, status code: {response.status_code}")
+            if response.status_code == 404 and branch == 'main':
+                # If 'main' branch fails, continue to check 'master'
+                continue
+            elif response.status_code != 404:
+                # If the error is not a 404, raise an exception
+                raise Exception(f"Failed to fetch file tree for {repo_name} from branch {branch}, status code: {response.status_code}")
 
-def get_repo_contributors(repo_url, token=None):
-    """
-    Fetch the contributors of a repository.
-    """
-    headers = {}
-    if token:
-        headers['Authorization'] = f'token {token}'
+    if not files:
+        raise Exception(f"Failed to fetch file tree for {repo_name} from both branches: 'main' and 'master'")
     
-    url = f"{repo_url}/contributors"
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        print(f"Error fetching contributors: {response.status_code}")
-        return []
-    
-    contributors = response.json()
-    return contributors
-
-def get_repo_commits(repo_url, token=None):
-    """
-    Fetch the commit history of a repository.
-    """
-    headers = {}
-    if token:
-        headers['Authorization'] = f'token {token}'
-    
-    url = f"{repo_url}/commits"
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        print(f"Error fetching commits: {response.status_code}")
-        return []
-    
-    commits = response.json()
-    return commits
-
-def fetch_repo_files(repo_owner, repo_name, path='', token=None):
-    """
-    Recursively fetch all code files (.py, .js, .cpp) from a GitHub repository, including files inside folders.
-    """
-    headers = {}
-    if token:
-        headers['Authorization'] = f'token {token}'
-
-    url = f"{API_ENDPOINT}/repos/{repo_owner}/{repo_name}/contents/{path}"
-    response = requests.get(url, headers=headers)
-    
-    if response.status_code != 200:
-        print(f"Error: Unable to fetch contents for {path}. Status Code: {response.status_code}")
-        return []
-    
-    contents = response.json()
     code_files = []
+    
+    # Define file extensions to prioritize
+    prioritized_extensions = ['.py', '.js', '.java', '.cpp', '.c', '.ts', '.rb', '.php']
 
-    for item in contents:
-        if item['type'] == 'file' and item['name'].endswith(('.py', '.js', '.cpp', '.c', '.java')):
-            # Check file size
-            if item['size'] <= FILE_SIZE_THRESHOLD:
-                code_files.append(item['download_url'])
-        elif item['type'] == 'dir':
-            # Recursively fetch files from subdirectories
-            code_files.extend(fetch_repo_files(repo_owner, repo_name, path=item['path'], token=token))
+    # Process the files and filter/prioritize
+    for file in files:
+        if file['type'] == 'blob':  # Ensure it's a file, not a directory
+            file_path = file['path']
+            file_size_kb = file.get('size', 0) / 1024
+            
+            # Prioritize based on extension
+            if any(file_path.endswith(ext) for ext in prioritized_extensions):
+                # Skip overly large files (example: more than 1 MB)
+                if file_size_kb < 1 * 1024:
+                    code_files.append({'file': file_path, 'size_kb': file_size_kb})
 
     return code_files
 
-def embed_code(code):
-    """
-    Generate an embedding for a code file using CodeBERT.
-    """
-    inputs = tokenizer(code, return_tensors="pt", padding=True, truncation=True)
-    outputs = model(**inputs)
-    embeddings = outputs.last_hidden_state.mean(dim=1)  # Pooling to get a single vector
-    return embeddings.detach().numpy()[0]
 
-def push_to_pinecone(file_urls, repo_name):
-    """
-    Fetch file contents, embed them, and push to Pinecone.
-    """
-    for file_url in file_urls:
-        response = requests.get(file_url)
-        if response.status_code == 200:
-            code_content = response.text
-            embedding = embed_code(code_content)
-            # Push to Pinecone
-            index.upsert(vectors=[(file_url, embedding)], namespace=repo_name)
+# Function to fetch the content of a file from GitHub
+def get_file_content(username, repo_name, file_path, token):
+    # Debug print statement
+    print("Inside get_file_content")
 
-def scrape_github_profile(username, token=None):
-    """
-    Scrape the public repositories of a GitHub user and retrieve the necessary details.
-    """
-    repos = get_user_repos(username, token=token)
+    url = f"https://api.github.com/repos/{username}/{repo_name}/contents/{file_path}"
+    headers = {'Authorization': f'token {token}'}
     
-    with ThreadPoolExecutor() as executor:
-        futures = []
-        for repo in repos:
-            repo_url = repo["url"]
-            futures.append(executor.submit(get_repo_details, repo_url, token))
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        content = response.json().get('content', '')
+        # Decode base64 content
+        content = base64.b64decode(content).decode('utf-8')
+        return content
+    else:
+        print(f"Failed to fetch content for {file_path}, status code: {response.status_code}")
+        return None
+
+# Function to initialize CodeBERT model
+def initialize_codebert():
+    # Debug print statement
+    print("Inside initialize_codebert")
+
+    tokenizer = RobertaTokenizer.from_pretrained('microsoft/codebert-base')
+    model = RobertaModel.from_pretrained('microsoft/codebert-base')
+    return tokenizer, model
+
+# Function to convert text to vector embeddings using CodeBERT
+def get_embedding(text, tokenizer, model):
+    # Debug print statement
+    print("Inside get_embedding")
+
+    inputs = tokenizer(text, return_tensors='pt', truncation=True, padding=True)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    # Use the mean of the hidden states as the embedding
+    embeddings = outputs.last_hidden_state.mean(dim=1)
+    return embeddings.squeeze().numpy()
+
+# Function to store prioritized files in Pinecone
+def store_prioritized_files_in_pinecone(username, repo_name, prioritized_files, token, pinecone_index, tokenizer, model):
+    # Debug print statement
+    print("Inside store_prioritized_files_in_pinecone")
+
+    for file_info in prioritized_files:
+        file_path = file_info['file']
+        file_content = get_file_content(username, repo_name, file_path, token)
         
-        for future in futures:
-            repo_details = future.result()
-            if not repo_details:
-                continue
+        if file_content:
+            # Convert file content to vector embedding using CodeBERT
+            embedding = get_embedding(file_content, tokenizer, model)
+            # Create a unique ID for the file (can be a combination of repo name + file path)
+            vector_id = f"{repo_name}/{file_path}"
             
-            repo_name = repo_details.get("name", "Unknown")
-            repo_description = repo_details.get("description", "No description")
-            repo_stars = repo_details.get("stargazers_count", 0)
-            repo_forks = repo_details.get("forks_count", 0)
-            repo_watchers = repo_details.get("subscribers_count", 0)
-            repo_size = repo_details.get("size", 0)
-            repo_owner = repo_details["owner"]["login"]
+            # Store the embedding in Pinecone along with metadata
+            pinecone_index.upsert(vectors=[(vector_id, embedding)], metadata={'repo_name': repo_name, 'file_path': file_path})
+
+# Main function to handle GitHub profile analysis and Pinecone storage
+def analyze_and_store_in_pinecone(profile_url, token, pinecone_index_name):
+    # Debug print statement
+    print("Inside analyze_and_store_in_pinecone")
+
+    try:
+        pinecone_index = initialize_pinecone(pinecone_index_name)
+        tokenizer, model = initialize_codebert()
+        
+        username = extract_username(profile_url)
+        repos = get_repositories(username, token)
+        
+        for repo in repos:
+            repo_name = repo['name']
+            print(f"Processing repository: {repo_name}")
             
-            languages = get_repo_languages(repo_details["url"], token=token)
-            contributors = get_repo_contributors(repo_details["url"], token=token)
-            commits = get_repo_commits(repo_details["url"], token=token)
-            code_files = fetch_repo_files(repo_owner, repo_name, token=token)
+            prioritized_files = prioritize_files(username, repo_name, token)
+            
+            # Debug print statement
+            print(f"Number of prioritized files: {len(prioritized_files)}")
+            
+            store_prioritized_files_in_pinecone(username, repo_name, prioritized_files, token, pinecone_index, tokenizer, model)
+            print(f"Stored {len(prioritized_files)} files from {repo_name} in Pinecone.")
+    
+    except Exception as e:
+        print(f"Error: {e}")
 
-            # Push the code files to Pinecone
-            push_to_pinecone(code_files, repo_name)
-
-            # Print the repository details
-            print(f"Repository: {repo_name}")
-            print(f"Description: {repo_description}")
-            print(f"Stars: {repo_stars}, Forks: {repo_forks}, Watchers: {repo_watchers}")
-            print(f"Primary Language: {list(languages.keys())[0] if languages else 'Unknown'}")
-            print(f"Contributors: {len(contributors)}, Commits: {len(commits)}")
-            print(f"Size: {repo_size} KB")
-            print(f"Code Files: {len(code_files)}")
-            print("---")
 
 # Example usage
-# username1 = "Akki-58"
-# username2 = "kanakmaheshwari3115"
-# token = os.getenv("GIT_KEY")
-# scrape_github_profile(username1, token)  # Replace with a real GitHub username and token
+if __name__ == "__main__":
+    github_profile_url = input("Enter GitHub profile URL: ")
+    # github_profile_url = "https://github.com/Akki-58/"
+    github_token = os.getenv("GIT_KEY") # Input GitHub token
+    pinecone_index_name = "github-code"  # Define a Pinecone index name
+    
+    analyze_and_store_in_pinecone(github_profile_url, github_token, pinecone_index_name)

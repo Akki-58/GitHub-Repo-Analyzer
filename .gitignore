@@ -251,5 +251,13 @@ $RECYCLE.BIN/
 Github_repo_venv
 conversational.py
 github_analyzer_test1.py
+prev_version.py
+test.py
+test2.py
+test3.py
+test4.py
+test6.py
+test7.py
+test7_b.py
 
 # End of https://www.toptal.com/developers/gitignore/api/python,osx,visualstudiocode,windows
